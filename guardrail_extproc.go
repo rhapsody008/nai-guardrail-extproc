@@ -1,36 +1,34 @@
 // guardrail_extproc.go
 //
 // Minimal gRPC ExtProc service implementing
-// envoy.service.ext_proc.v3.ExternalProcessor for a prompt guardrail
-// that checks both directions, OpenAI-compatible SDK/endpoint only:
+// envoy.service.ext_proc.v3.ExternalProcessor for a PRE-CALL prompt
+// guardrail, OpenAI-compatible SDK/endpoint only:
 //
-//   - Pre-call: buffers the request body, extracts the user's prompt,
-//     sends it to an OpenAI-compatible endpoint, and if flagged,
-//     returns a synthesized 200 chat completion whose assistant
-//     message is a gentle refusal (finish_reason: content_filter) —
-//     so the client renders it as a normal chat turn, not an error.
-//   - Post-call: buffers the response body, extracts the model's
-//     completion text, runs it through the same guardrail endpoint,
-//     and replaces the response with the same gentle refusal if
-//     flagged.
+//   Buffers the request body, extracts the user's prompt, sends it to
+//   an OpenAI-compatible endpoint, and if flagged, returns a
+//   synthesized 200 chat completion whose assistant message is a
+//   gentle refusal (finish_reason: content_filter) — so the client
+//   renders it as a normal chat turn, not an error.
 //
-// Both checks call the same guardrail model — one classifies a prompt,
-// the other classifies a completion, but it's the same request shape
-// and the same endpoint.
+// Post-call (checking the model's completion after generation) was
+// deliberately dropped: with Buffered response mode it can only start
+// after the entire completion has already been generated, adding a
+// full extra sequential LLM call with zero bytes visible to the
+// client in the meantime. That pushed total round-trip time close to
+// (and in testing, past) an upstream Cloudflare Tunnel timeout that
+// isn't configurable from this side. Pre-call only removes that
+// failure mode entirely. If post-call moderation is needed later, do
+// it as FULL_DUPLEX_STREAMED so it can run alongside a still-streaming
+// response instead of after it.
 //
 // The real block reason is never shown to the end user (a categorized
 // refusal is easy to probe against) — it only goes out in the
 // x-guardrail-blocked response header, for your own logs/alerting.
 //
-// Wire it in via an EnvoyExtensionPolicy targeting the Gateway, with
-// processingMode.request.body = Buffered AND response.body = Buffered.
-//
-// Buffered response mode means the full completion has to arrive
-// before the client sees any of it — this breaks SSE streaming to the
-// client. That's a known, accepted trade-off for now (see chat); the
-// upgrade path if streaming matters later is FULL_DUPLEX_STREAMED mode
-// on the response side, which needs a chunked inspect-and-forward loop
-// instead of the single buffer-then-decide step used here.
+// Wire it in via an EnvoyExtensionPolicy targeting the relevant
+// HTTPRoutes, with processingMode.request.body = Buffered. Do NOT set
+// processingMode.response — omitting it entirely means Envoy never
+// sends response-phase messages to this service at all.
 //
 // Config is via environment variables (set these from a Kubernetes
 // Secret, not inline in the Deployment spec):
@@ -109,8 +107,9 @@ type chatMessage struct {
 }
 
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
+	Model     string        `json:"model"`
+	Messages  []chatMessage `json:"messages"`
+	MaxTokens int           `json:"max_tokens"`
 }
 
 type chatResponse struct {
@@ -119,10 +118,17 @@ type chatResponse struct {
 	} `json:"choices"`
 }
 
-const guardrailSystemPrompt = `You are a content safety classifier. ` +
-	`Reply with exactly one word: SAFE or UNSAFE. ` +
-	`Reply UNSAFE if the user message requests illegal acts, ` +
-	`violence, weapons, CSAM, or other clearly harmful content.`
+// Llama Guard models (and similar dedicated safety classifiers) have
+// their own baked-in chat template that embeds the moderation
+// instructions itself — they don't accept a caller-supplied system
+// prompt the way general chat models do. Sending a system+user pair
+// causes a 400 ("Conversation roles must alternate...") because the
+// template only expects user/assistant turns. Send just the content
+// to classify as a single user turn and let the template do the rest.
+//
+// If you swap in a different guardrail model that DOES expect a
+// system prompt, this is the place to add one back — a
+// classifier-specific model shouldn't need one.
 
 // callGuardrail sends the given text (a request prompt or a response
 // completion — same shape either way) to the OpenAI-compatible endpoint
@@ -132,9 +138,13 @@ func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool
 	reqBody, err := json.Marshal(chatRequest{
 		Model: cfg.model,
 		Messages: []chatMessage{
-			{Role: "system", Content: guardrailSystemPrompt},
 			{Role: "user", Content: content},
 		},
+		// the verdict is always a short one-line answer (e.g.
+		// "safe" or "unsafe\nS1,S4") — capping this bounds
+		// generation time and keeps it from eating into the
+		// ext_proc timeout budget for no reason
+		MaxTokens: 20,
 	})
 	if err != nil {
 		return true, err
@@ -192,19 +202,6 @@ func extractPrompt(body []byte) string {
 	return string(body)
 }
 
-// extractResponseText pulls the completion text out of an OpenAI-shape
-// response body: choices[0].message.content. Falls back to the whole
-// body if that doesn't match.
-func extractResponseText(body []byte) string {
-	var openai chatResponse
-	if err := json.Unmarshal(body, &openai); err == nil && len(openai.Choices) > 0 {
-		if c := openai.Choices[0].Message.Content; c != "" {
-			return c
-		}
-	}
-	return string(body)
-}
-
 // ---- ExtProc server ----
 
 type guardrailServer struct {
@@ -212,7 +209,7 @@ type guardrailServer struct {
 	cfg config
 }
 
-const gentleBlockedMessage = "I'm sorry, but I can't help with that request. It's blocked by Guardrail."
+const gentleBlockedMessage = "I'm sorry, but I can't help with that request."
 
 // blockedGentleBody builds a synthetic OpenAI chat-completion response
 // body carrying the gentle refusal as the assistant's message content,
@@ -244,6 +241,15 @@ func blockedGentleBody() []byte {
 // turn rather than raising an SDK-level error. The real block reason
 // (for your own logs/alerting, not shown to the end user) goes in the
 // x-guardrail-blocked header.
+//
+// Both Value and RawValue are set on each header. Evidence from a
+// live curl test: header KEYS came through but VALUES were empty
+// (content-type missing entirely, x-guardrail-blocked present with no
+// value) even with AppendAction forced to overwrite. HeaderValue.Value
+// is deprecated in recent Envoy releases in favor of RawValue — this
+// Envoy build (v1.37.0) appears to only honor RawValue. Setting both
+// covers either case without needing to know which one a given Envoy
+// version actually reads.
 func blockedResponse(reason string) *extprocv3.ProcessingResponse {
 	return &extprocv3.ProcessingResponse{
 		Response: &extprocv3.ProcessingResponse_ImmediateResponse{
@@ -252,8 +258,22 @@ func blockedResponse(reason string) *extprocv3.ProcessingResponse {
 				Body:   blockedGentleBody(),
 				Headers: &extprocv3.HeaderMutation{
 					SetHeaders: []*corev3.HeaderValueOption{
-						{Header: &corev3.HeaderValue{Key: "content-type", Value: "application/json"}},
-						{Header: &corev3.HeaderValue{Key: "x-guardrail-blocked", Value: reason}},
+						{
+							Header: &corev3.HeaderValue{
+								Key:      "content-type",
+								Value:    "application/json",
+								RawValue: []byte("application/json"),
+							},
+							AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+						},
+						{
+							Header: &corev3.HeaderValue{
+								Key:      "x-guardrail-blocked",
+								Value:    reason,
+								RawValue: []byte(reason),
+							},
+							AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+						},
 					},
 				},
 			},
@@ -275,26 +295,6 @@ func passThroughHeaders() *extprocv3.ProcessingResponse {
 	return &extprocv3.ProcessingResponse{
 		Response: &extprocv3.ProcessingResponse_RequestHeaders{
 			RequestHeaders: &extprocv3.HeadersResponse{
-				Response: &extprocv3.CommonResponse{Status: extprocv3.CommonResponse_CONTINUE},
-			},
-		},
-	}
-}
-
-func passThroughResponseHeaders() *extprocv3.ProcessingResponse {
-	return &extprocv3.ProcessingResponse{
-		Response: &extprocv3.ProcessingResponse_ResponseHeaders{
-			ResponseHeaders: &extprocv3.HeadersResponse{
-				Response: &extprocv3.CommonResponse{Status: extprocv3.CommonResponse_CONTINUE},
-			},
-		},
-	}
-}
-
-func continueResponseBody() *extprocv3.ProcessingResponse {
-	return &extprocv3.ProcessingResponse{
-		Response: &extprocv3.ProcessingResponse_ResponseBody{
-			ResponseBody: &extprocv3.BodyResponse{
 				Response: &extprocv3.CommonResponse{Status: extprocv3.CommonResponse_CONTINUE},
 			},
 		},
@@ -334,41 +334,24 @@ func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServ
 				continue
 			}
 			if unsafe {
+				log.Printf("guardrail check [request]: BLOCKED")
 				if err := stream.Send(blockedResponse("flagged_unsafe")); err != nil {
 					return err
 				}
 				continue
 			}
+			log.Printf("guardrail check [request]: passed")
 			if err := stream.Send(continueRequest()); err != nil {
 				return err
 			}
 
-		case *extprocv3.ProcessingRequest_ResponseHeaders:
-			if err := stream.Send(passThroughResponseHeaders()); err != nil {
-				return err
-			}
-
-		case *extprocv3.ProcessingRequest_ResponseBody:
-			completion := extractResponseText(v.ResponseBody.Body)
-
-			ctx, cancel := context.WithTimeout(stream.Context(), 5*time.Second)
-			unsafe, err := callGuardrail(ctx, s.cfg, completion)
-			cancel()
-
-			if err != nil {
-				log.Printf("guardrail call failed on response, blocking (fail-closed): %v", err)
-				if err := stream.Send(blockedResponse("guardrail_unavailable")); err != nil {
-					return err
-				}
-				continue
-			}
-			if unsafe {
-				if err := stream.Send(blockedResponse("response_flagged_unsafe")); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := stream.Send(continueResponseBody()); err != nil {
+		case *extprocv3.ProcessingRequest_ResponseHeaders, *extprocv3.ProcessingRequest_ResponseBody:
+			// Should never actually arrive — processingMode.response is
+			// deliberately unset in the EnvoyExtensionPolicy, so Envoy
+			// shouldn't send these. Pass through harmlessly if it
+			// somehow does (e.g. policy misconfiguration) rather than
+			// erroring the whole stream.
+			if err := stream.Send(&extprocv3.ProcessingResponse{}); err != nil {
 				return err
 			}
 
@@ -401,9 +384,10 @@ func main() {
 
 // ---- deployment notes ----
 //
-// Remember to set BOTH processingMode.request.body = Buffered and
-// processingMode.response.body = Buffered on the EnvoyExtensionPolicy —
-// missing the response side means this ResponseBody case never fires.
+// Set processingMode.request.body = Buffered on the
+// EnvoyExtensionPolicy. Do NOT set processingMode.response at all —
+// its presence, even with no body mode specified, is enough to make
+// Envoy start sending response-phase messages to this service.
 //
 // Put the API key in a Secret, not a ConfigMap or inline env value:
 //
