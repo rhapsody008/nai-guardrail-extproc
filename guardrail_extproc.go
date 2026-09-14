@@ -43,6 +43,13 @@
 //                        an env var (see Deployment YAML notes at the
 //                        bottom of this file).
 //   LISTEN_ADDR          gRPC listen address. Defaults to :9002.
+//   GUARDRAIL_DEBUG      Set to "true"/"1"/"yes"/"on" to log a single
+//                        record line per scan call: the request URL
+//                        and body, the response status code, and the
+//                        raw response body. Off by default — this
+//                        includes raw prompt content and the full CAI
+//                        response, so only turn it on where those logs
+//                        are appropriately access-controlled.
 //
 // Build: go build -o guardrail-extproc .
 // Deps:
@@ -75,6 +82,7 @@ type config struct {
 	endpoint string
 	apiKey   string
 	listen   string
+	debug    bool
 }
 
 func loadConfig() config {
@@ -82,6 +90,7 @@ func loadConfig() config {
 		endpoint: os.Getenv("GUARDRAIL_ENDPOINT"),
 		apiKey:   os.Getenv("GUARDRAIL_API_KEY"),
 		listen:   os.Getenv("LISTEN_ADDR"),
+		debug:    isTruthy(os.Getenv("GUARDRAIL_DEBUG")),
 	}
 	if cfg.listen == "" {
 		cfg.listen = ":9002"
@@ -90,6 +99,14 @@ func loadConfig() config {
 		log.Fatal("GUARDRAIL_ENDPOINT is required (CAI base URL)")
 	}
 	return cfg
+}
+
+func isTruthy(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // ---- CAI Scans API client ----
@@ -166,14 +183,27 @@ func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool
 	}
 	defer resp.Body.Close()
 
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return true, err
+	}
+
+	// GUARDRAIL_DEBUG record line: the call, the status, and the exact
+	// bytes returned, flattened to one line so a log pipeline can
+	// index/grep it as a single record. Off by default since it
+	// includes raw prompt content and the full scan response.
+	if cfg.debug {
+		log.Printf("[debug] POST %s reqBody=%s status=%d respBody=%s",
+			url, oneLine(reqBody), resp.StatusCode, oneLine(respBody))
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		log.Printf("scan API returned %d: %s", resp.StatusCode, string(body))
+		log.Printf("scan API returned %d: %s", resp.StatusCode, string(respBody))
 		return true, nil
 	}
 
 	var parsed scanResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return true, err
 	}
 
@@ -189,6 +219,12 @@ func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool
 		return true, nil
 	}
 	return false, nil
+}
+
+// oneLine collapses whitespace (including embedded newlines) so a
+// logged blob of JSON stays on a single log line.
+func oneLine(b []byte) string {
+	return strings.Join(strings.Fields(string(b)), " ")
 }
 
 // extractPrompt pulls the last user message out of an OpenAI-style
