@@ -5,10 +5,10 @@
 // guardrail, OpenAI-compatible SDK/endpoint only:
 //
 //   Buffers the request body, extracts the user's prompt, sends it to
-//   an OpenAI-compatible endpoint, and if flagged, returns a
-//   synthesized 200 chat completion whose assistant message is a
-//   gentle refusal (finish_reason: content_filter) — so the client
-//   renders it as a normal chat turn, not an error.
+//   the CAI Scans API, and if flagged, returns a synthesized 200 chat
+//   completion whose assistant message is a gentle refusal
+//   (finish_reason: content_filter) — so the client renders it as a
+//   normal chat turn, not an error.
 //
 // Post-call (checking the model's completion after generation) was
 // deliberately dropped: with Buffered response mode it can only start
@@ -33,17 +33,15 @@
 // Config is via environment variables (set these from a Kubernetes
 // Secret, not inline in the Deployment spec):
 //
-//   GUARDRAIL_ENDPOINT   OpenAI-compatible base URL, e.g.
-//                        http://llama-guard.nai-system.svc:8000/v1
+//   GUARDRAIL_ENDPOINT   CAI base URL, e.g. https://api.example.com/v1
+//                        (this code appends "/scans").
 //   GUARDRAIL_API_KEY    Bearer token for that endpoint. This is the
 //                        "place to put the API key" — it never touches
 //                        the client request, it's only used on the
-//                        outbound call from this service to the
-//                        guardrail model. Put it in a Secret and mount
-//                        it as an env var (see Deployment YAML notes
-//                        at the bottom of this file).
-//   GUARDRAIL_MODEL      Model name to send in the request body,
-//                        e.g. "llama-guard-3-8b". Defaults below.
+//                        outbound call from this service to the CAI
+//                        Scans API. Put it in a Secret and mount it as
+//                        an env var (see Deployment YAML notes at the
+//                        bottom of this file).
 //   LISTEN_ADDR          gRPC listen address. Defaults to :9002.
 //
 // Build: go build -o guardrail-extproc .
@@ -76,7 +74,6 @@ import (
 type config struct {
 	endpoint string
 	apiKey   string
-	model    string
 	listen   string
 }
 
@@ -84,73 +81,75 @@ func loadConfig() config {
 	cfg := config{
 		endpoint: os.Getenv("GUARDRAIL_ENDPOINT"),
 		apiKey:   os.Getenv("GUARDRAIL_API_KEY"),
-		model:    os.Getenv("GUARDRAIL_MODEL"),
 		listen:   os.Getenv("LISTEN_ADDR"),
-	}
-	if cfg.model == "" {
-		cfg.model = "llama-guard-3-8b"
 	}
 	if cfg.listen == "" {
 		cfg.listen = ":9002"
 	}
 	if cfg.endpoint == "" {
-		log.Fatal("GUARDRAIL_ENDPOINT is required (OpenAI-compatible base URL)")
+		log.Fatal("GUARDRAIL_ENDPOINT is required (CAI base URL)")
 	}
 	return cfg
 }
 
-// ---- OpenAI-compatible client ----
+// ---- CAI Scans API client ----
 
+// chatMessage mirrors the OpenAI chat message shape used by the
+// client's incoming request body (see extractPrompt) — unrelated to
+// the CAI Scans API, which takes plain text.
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-type chatRequest struct {
-	Model     string        `json:"model"`
-	Messages  []chatMessage `json:"messages"`
-	MaxTokens int           `json:"max_tokens"`
+type scanRequest struct {
+	Input string `json:"input"`
 }
 
-type chatResponse struct {
-	Choices []struct {
-		Message chatMessage `json:"message"`
-	} `json:"choices"`
+type scannerVersionMeta struct {
+	ID          string `json:"id"`
+	CreatedAt   string `json:"createdAt"`
+	CreatedBy   string `json:"createdBy"`
+	Name        string `json:"name"`
+	Published   bool   `json:"published"`
+	Description string `json:"description"`
 }
 
-// Llama Guard models (and similar dedicated safety classifiers) have
-// their own baked-in chat template that embeds the moderation
-// instructions itself — they don't accept a caller-supplied system
-// prompt the way general chat models do. Sending a system+user pair
-// causes a 400 ("Conversation roles must alternate...") because the
-// template only expects user/assistant turns. Send just the content
-// to classify as a single user turn and let the template do the rest.
-//
-// If you swap in a different guardrail model that DOES expect a
-// system prompt, this is the place to add one back — a
-// classifier-specific model shouldn't need one.
+type scannerResult struct {
+	ScannerID          string             `json:"scannerId"`
+	ScannerVersionMeta scannerVersionMeta `json:"scannerVersionMeta"`
+	Outcome            string             `json:"outcome"`
+	CustomConfig       bool               `json:"customConfig"`
+	StartedDate        string             `json:"startedDate"`
+	CompletedDate      string             `json:"completedDate"`
+	ScanDirection      string             `json:"scanDirection"`
+}
+
+type scanResult struct {
+	ScannerResults []scannerResult `json:"scannerResults"`
+	Outcome        string          `json:"outcome"`
+}
+
+type scanResponse struct {
+	ID            string     `json:"id"`
+	Result        scanResult `json:"result"`
+	RedactedInput string     `json:"redactedInput"`
+}
 
 // callGuardrail sends the given text (a request prompt or a response
-// completion — same shape either way) to the OpenAI-compatible endpoint
-// and reports whether it was flagged unsafe. On any transport or
-// parsing error it fails closed (blocks) and returns the error.
+// completion — same shape either way) to the CAI Scans API and
+// reports whether it was flagged unsafe. A scan only counts as safe
+// when result.outcome is exactly "cleared" — any other value (a
+// specific block reason, or an outcome this code doesn't recognize
+// yet) fails closed, consistent with the transport/parsing error
+// handling below.
 func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool, err error) {
-	reqBody, err := json.Marshal(chatRequest{
-		Model: cfg.model,
-		Messages: []chatMessage{
-			{Role: "user", Content: content},
-		},
-		// the verdict is always a short one-line answer (e.g.
-		// "safe" or "unsafe\nS1,S4") — capping this bounds
-		// generation time and keeps it from eating into the
-		// ext_proc timeout budget for no reason
-		MaxTokens: 20,
-	})
+	reqBody, err := json.Marshal(scanRequest{Input: content})
 	if err != nil {
 		return true, err
 	}
 
-	url := strings.TrimRight(cfg.endpoint, "/") + "/chat/completions"
+	url := strings.TrimRight(cfg.endpoint, "/") + "/scans"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
 		return true, err
@@ -169,20 +168,27 @@ func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		log.Printf("guardrail endpoint returned %d: %s", resp.StatusCode, string(body))
+		log.Printf("scan API returned %d: %s", resp.StatusCode, string(body))
 		return true, nil
 	}
 
-	var parsed chatResponse
+	var parsed scanResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		return true, err
 	}
-	if len(parsed.Choices) == 0 {
+
+	if parsed.Result.Outcome != "cleared" {
+		var flagged []string
+		for _, sr := range parsed.Result.ScannerResults {
+			if sr.Outcome != "passed" {
+				flagged = append(flagged, sr.ScannerID+":"+sr.Outcome)
+			}
+		}
+		log.Printf("scan %s flagged (outcome=%s, scanners=%v), redactedInput=%q",
+			parsed.ID, parsed.Result.Outcome, flagged, parsed.RedactedInput)
 		return true, nil
 	}
-
-	verdict := strings.ToUpper(strings.TrimSpace(parsed.Choices[0].Message.Content))
-	return strings.Contains(verdict, "UNSAFE"), nil
+	return false, nil
 }
 
 // extractPrompt pulls the last user message out of an OpenAI-style
@@ -375,8 +381,8 @@ func main() {
 	grpcServer := grpc.NewServer()
 	extprocv3.RegisterExternalProcessorServer(grpcServer, &guardrailServer{cfg: cfg})
 
-	log.Printf("guardrail extproc listening on %s, guardrail endpoint %s, model %s",
-		cfg.listen, cfg.endpoint, cfg.model)
+	log.Printf("guardrail extproc listening on %s, guardrail endpoint %s",
+		cfg.listen, cfg.endpoint)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("serve error: %v", err)
 	}
@@ -399,9 +405,7 @@ func main() {
 //
 //   env:
 //     - name: GUARDRAIL_ENDPOINT
-//       value: "http://llama-guard.nai-system.svc:8000/v1"
-//     - name: GUARDRAIL_MODEL
-//       value: "llama-guard-3-8b"
+//       value: "https://api.example.com/v1"
 //     - name: GUARDRAIL_API_KEY
 //       valueFrom:
 //         secretKeyRef:
