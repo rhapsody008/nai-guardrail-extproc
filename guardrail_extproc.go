@@ -4,11 +4,19 @@
 // envoy.service.ext_proc.v3.ExternalProcessor for a PRE-CALL prompt
 // guardrail, OpenAI-compatible SDK/endpoint only:
 //
-//   Buffers the request body, extracts the user's prompt, sends it to
-//   the CAI Scans API, and if flagged, returns a synthesized 200 chat
-//   completion whose assistant message is a gentle refusal
-//   (finish_reason: content_filter) — so the client renders it as a
-//   normal chat turn, not an error.
+//   On RequestHeaders, decides whether this request is in scope (see
+//   inScope/scopedSuffixes) — a POST to a chat/completions-style path,
+//   not MCP or anything else sharing the gateway. Everything out of
+//   scope is passed through untouched with no CalypsoAI call at all;
+//   this matters when attached at Gateway level, since that means this
+//   service otherwise sees every request through the gateway (UI, IAM,
+//   oauth2-proxy, MCP, dataplane), not just model calls.
+//
+//   In scope, it buffers the request body, extracts the user's
+//   prompt, sends it to the CAI Scans API, and if flagged, returns a
+//   synthesized 200 chat completion whose assistant message is a
+//   gentle refusal (finish_reason: content_filter) — so the client
+//   renders it as a normal chat turn, not an error.
 //
 // Post-call (checking the model's completion after generation) was
 // deliberately dropped: with Buffered response mode it can only start
@@ -25,10 +33,13 @@
 // refusal is easy to probe against) — it only goes out in the
 // x-guardrail-blocked response header, for your own logs/alerting.
 //
-// Wire it in via an EnvoyExtensionPolicy targeting the relevant
-// HTTPRoutes, with processingMode.request.body = Buffered. Do NOT set
-// processingMode.response — omitting it entirely means Envoy never
-// sends response-phase messages to this service at all.
+// Wire it in via an EnvoyExtensionPolicy targeting the Gateway itself
+// (see guardrail-extension-policy.yaml), with processingMode.request.body
+// = Buffered. Scope is enforced in this code (see inScope), not by
+// route selection, so a route-scoped policy overrides this one for
+// whatever routes it targets — don't leave both attached at once. Do
+// NOT set processingMode.response — omitting it entirely means Envoy
+// never sends response-phase messages to this service at all.
 //
 // Config is via environment variables (set these from a Kubernetes
 // Secret, not inline in the Deployment spec):
@@ -67,6 +78,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -244,6 +256,54 @@ func extractPrompt(body []byte) string {
 	return string(body)
 }
 
+// scopedPaths are the request path suffixes that carry an OpenAI-style chat
+// body worth scanning. Everything else through the gateway — UI, IAM,
+// oauth2-proxy, MCP, dataplane, health — is passed through untouched.
+//
+// Matching is on the suffix so it works regardless of the gateway root
+// prefix in play (/enterpriseai/gateway/... or /enterpriseai/v1/...).
+var scopedSuffixes = []string{
+	"/chat/completions",
+	"/completions",
+}
+
+// inScope reports whether this request should be scanned. It is deliberately
+// conservative: anything it cannot positively identify as a chat completion
+// POST is passed through.
+func inScope(headers *corev3.HeaderMap) bool {
+	var method, reqPath string
+	for _, h := range headers.GetHeaders() {
+		v := h.Value
+		if v == "" && len(h.RawValue) > 0 {
+			v = string(h.RawValue)
+		}
+		switch strings.ToLower(h.Key) {
+		case ":method":
+			method = strings.ToUpper(v)
+		case ":path":
+			reqPath = v
+		}
+	}
+	if method != "POST" || reqPath == "" {
+		return false
+	}
+	// strip query string
+	if i := strings.IndexByte(reqPath, '?'); i >= 0 {
+		reqPath = reqPath[:i]
+	}
+	// MCP traffic lives under the same root prefix — never scan it.
+	if strings.Contains(reqPath, "/mcp/") {
+		return false
+	}
+	clean := path.Clean(reqPath)
+	for _, s := range scopedSuffixes {
+		if strings.HasSuffix(clean, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // ---- ExtProc server ----
 
 type guardrailServer struct {
@@ -344,6 +404,11 @@ func passThroughHeaders() *extprocv3.ProcessingResponse {
 }
 
 func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServer) error {
+	// Per-stream scope decision, set on RequestHeaders and read on RequestBody.
+	// Defaults to false so a stream that somehow skips the headers phase is
+	// passed through rather than scanned.
+	scanThis := false
+
 	for {
 		req, err := stream.Recv()
 		if err == io.EOF {
@@ -356,11 +421,19 @@ func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServ
 		switch v := req.Request.(type) {
 
 		case *extprocv3.ProcessingRequest_RequestHeaders:
+			scanThis = inScope(v.RequestHeaders.GetHeaders())
 			if err := stream.Send(passThroughHeaders()); err != nil {
 				return err
 			}
 
 		case *extprocv3.ProcessingRequest_RequestBody:
+			if !scanThis {
+				if err := stream.Send(continueRequest()); err != nil {
+					return err
+				}
+				continue
+			}
+
 			prompt := extractPrompt(v.RequestBody.Body)
 
 			ctx, cancel := context.WithTimeout(stream.Context(), 5*time.Second)
