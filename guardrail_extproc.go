@@ -155,21 +155,24 @@ type scanResponse struct {
 
 // callGuardrail sends the given text (a request prompt or a response
 // completion — same shape either way) to the CAI Scans API and
-// reports whether it was flagged unsafe. A scan only counts as safe
-// when result.outcome is exactly "cleared" — any other value (a
+// reports whether it was flagged unsafe, along with the redacted form
+// of the prompt as returned by the scan API. A scan only counts as
+// safe when result.outcome is exactly "cleared" — any other value (a
 // specific block reason, or an outcome this code doesn't recognize
 // yet) fails closed, consistent with the transport/parsing error
-// handling below.
-func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool, err error) {
+// handling below. redacted is "" when the API returned nothing
+// usable; callers must treat that as "no redaction available" rather
+// than "redact to empty".
+func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool, redacted string, err error) {
 	reqBody, err := json.Marshal(scanRequest{Input: content})
 	if err != nil {
-		return true, err
+		return true, "", err
 	}
 
 	url := strings.TrimRight(cfg.endpoint, "/") + "/scans"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
-		return true, err
+		return true, "", err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if cfg.apiKey != "" {
@@ -179,13 +182,13 @@ func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return true, err
+		return true, "", err
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return true, err
+		return true, "", err
 	}
 
 	// GUARDRAIL_DEBUG record line: the call, the status, and the exact
@@ -199,12 +202,12 @@ func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("scan API returned %d: %s", resp.StatusCode, string(respBody))
-		return true, nil
+		return true, "", nil
 	}
 
 	var parsed scanResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return true, err
+		return true, "", err
 	}
 
 	if parsed.Result.Outcome != "cleared" {
@@ -216,9 +219,9 @@ func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool
 		}
 		log.Printf("scan %s flagged (outcome=%s, scanners=%v), redactedInput=%q",
 			parsed.ID, parsed.Result.Outcome, flagged, parsed.RedactedInput)
-		return true, nil
+		return true, parsed.RedactedInput, nil
 	}
-	return false, nil
+	return false, parsed.RedactedInput, nil
 }
 
 // oneLine collapses whitespace (including embedded newlines) so a
@@ -242,6 +245,63 @@ func extractPrompt(body []byte) string {
 		}
 	}
 	return string(body)
+}
+
+// redactBody replaces the last user message's content with redacted and
+// returns the re-serialised body. Returns ok=false when the body is not a
+// shape it can safely rewrite, in which case the caller must forward the
+// original bytes unmodified.
+//
+// Uses a generic map rather than a typed struct so that fields this service
+// does not model — tools, response_format, stream_options, vendor extensions
+// — survive the round trip untouched.
+func redactBody(body []byte, redacted string) ([]byte, bool) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, false
+	}
+	rawMsgs, present := doc["messages"]
+	if !present {
+		return nil, false
+	}
+	var msgs []map[string]json.RawMessage
+	if err := json.Unmarshal(rawMsgs, &msgs); err != nil {
+		return nil, false
+	}
+
+	for i := len(msgs) - 1; i >= 0; i-- {
+		var role string
+		if err := json.Unmarshal(msgs[i]["role"], &role); err != nil {
+			continue
+		}
+		if role != "user" {
+			continue
+		}
+		// Only rewrite plain string content. Multimodal content arrives as an
+		// array of parts; extractPrompt cannot read those either, so there is
+		// nothing coherent to substitute and we leave the body alone.
+		var content string
+		if err := json.Unmarshal(msgs[i]["content"], &content); err != nil {
+			return nil, false
+		}
+		newContent, err := json.Marshal(redacted)
+		if err != nil {
+			return nil, false
+		}
+		msgs[i]["content"] = newContent
+
+		rebuilt, err := json.Marshal(msgs)
+		if err != nil {
+			return nil, false
+		}
+		doc["messages"] = rebuilt
+		out, err := json.Marshal(doc)
+		if err != nil {
+			return nil, false
+		}
+		return out, true
+	}
+	return nil, false
 }
 
 // ---- ExtProc server ----
@@ -333,6 +393,27 @@ func continueRequest() *extprocv3.ProcessingResponse {
 	}
 }
 
+// continueWithBody forwards the request upstream with body replaced.
+//
+// Envoy is responsible for reconciling content-length after a buffered body
+// mutation. Verify this on your build: if the backend rejects requests or
+// hangs after redaction changes the body length, that reconciliation is the
+// first thing to check.
+func continueWithBody(body []byte) *extprocv3.ProcessingResponse {
+	return &extprocv3.ProcessingResponse{
+		Response: &extprocv3.ProcessingResponse_RequestBody{
+			RequestBody: &extprocv3.BodyResponse{
+				Response: &extprocv3.CommonResponse{
+					Status: extprocv3.CommonResponse_CONTINUE,
+					BodyMutation: &extprocv3.BodyMutation{
+						Mutation: &extprocv3.BodyMutation_Body{Body: body},
+					},
+				},
+			},
+		},
+	}
+}
+
 func passThroughHeaders() *extprocv3.ProcessingResponse {
 	return &extprocv3.ProcessingResponse{
 		Response: &extprocv3.ProcessingResponse_RequestHeaders{
@@ -361,10 +442,11 @@ func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServ
 			}
 
 		case *extprocv3.ProcessingRequest_RequestBody:
-			prompt := extractPrompt(v.RequestBody.Body)
+			original := v.RequestBody.Body
+			prompt := extractPrompt(original)
 
 			ctx, cancel := context.WithTimeout(stream.Context(), 5*time.Second)
-			unsafe, err := callGuardrail(ctx, s.cfg, prompt)
+			unsafe, redacted, err := callGuardrail(ctx, s.cfg, prompt)
 			cancel()
 
 			if err != nil {
@@ -382,7 +464,23 @@ func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServ
 				}
 				continue
 			}
-			log.Printf("guardrail check [request]: passed")
+
+			// Cleared. Substitute the redacted prompt only when the scan
+			// actually changed something and the body is a shape we can
+			// rewrite; otherwise forward the original bytes untouched.
+			if redacted != "" && redacted != prompt {
+				if newBody, ok := redactBody(original, redacted); ok {
+					log.Printf("guardrail check [request]: passed (redacted, %d -> %d bytes)",
+						len(original), len(newBody))
+					if err := stream.Send(continueWithBody(newBody)); err != nil {
+						return err
+					}
+					continue
+				}
+				log.Printf("guardrail check [request]: passed (redaction available but body not rewritable, forwarding original)")
+			} else {
+				log.Printf("guardrail check [request]: passed")
+			}
 			if err := stream.Send(continueRequest()); err != nil {
 				return err
 			}
