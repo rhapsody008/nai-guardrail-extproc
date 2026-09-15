@@ -492,7 +492,7 @@ func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServ
 			prompt := extractPrompt(original)
 
 			ctx, cancel := context.WithTimeout(stream.Context(), 5*time.Second)
-			v, err := callGuardrail(ctx, s.cfg, prompt)
+			gv, err := callGuardrail(ctx, s.cfg, prompt)
 			cancel()
 
 			if err != nil {
@@ -502,10 +502,10 @@ func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServ
 				}
 				continue
 			}
-			if v.Blocked {
+			if gv.Blocked {
 				log.Printf("guardrail check [request]: BLOCKED scan=%s outcome=%s failed=[%s]",
-					v.ScanID, v.Outcome, strings.Join(v.Failed, "; "))
-				if err := stream.Send(blockedResponse("flagged_unsafe", v.ScanID)); err != nil {
+					gv.ScanID, gv.Outcome, strings.Join(gv.Failed, "; "))
+				if err := stream.Send(blockedResponse("flagged_unsafe", gv.ScanID)); err != nil {
 					return err
 				}
 				continue
@@ -514,18 +514,18 @@ func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServ
 			// Cleared. Substitute the redacted prompt only when the scan
 			// actually changed something and the body is a shape we can
 			// rewrite; otherwise forward the original bytes untouched.
-			if v.Redacted != "" && v.Redacted != prompt {
-				if newBody, ok := redactBody(original, v.Redacted); ok {
+			if gv.Redacted != "" && gv.Redacted != prompt {
+				if newBody, ok := redactBody(original, gv.Redacted); ok {
 					log.Printf("guardrail check [request]: passed scan=%s (redacted, %d -> %d bytes)",
-						v.ScanID, len(original), len(newBody))
+						gv.ScanID, len(original), len(newBody))
 					if err := stream.Send(continueWithBody(newBody)); err != nil {
 						return err
 					}
 					continue
 				}
-				log.Printf("guardrail check [request]: passed scan=%s (redaction available but body not rewritable, forwarding original)", v.ScanID)
+				log.Printf("guardrail check [request]: passed scan=%s (redaction available but body not rewritable, forwarding original)", gv.ScanID)
 			} else {
-				log.Printf("guardrail check [request]: passed scan=%s", v.ScanID)
+				log.Printf("guardrail check [request]: passed scan=%s", gv.ScanID)
 			}
 			if err := stream.Send(continueRequest()); err != nil {
 				return err
