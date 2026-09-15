@@ -62,6 +62,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -124,55 +125,91 @@ type scanRequest struct {
 }
 
 type scannerVersionMeta struct {
-	ID          string `json:"id"`
-	CreatedAt   string `json:"createdAt"`
-	CreatedBy   string `json:"createdBy"`
-	Name        string `json:"name"`
-	Published   bool   `json:"published"`
-	Description string `json:"description"`
+	ID   string `json:"id"`
+	Name string `json:"name"` // scanner package, e.g. "2026-09"
 }
 
 type scannerResult struct {
-	ScannerID          string             `json:"scannerId"`
-	ScannerVersionMeta scannerVersionMeta `json:"scannerVersionMeta"`
-	Outcome            string             `json:"outcome"`
-	CustomConfig       bool               `json:"customConfig"`
-	StartedDate        string             `json:"startedDate"`
-	CompletedDate      string             `json:"completedDate"`
-	ScanDirection      string             `json:"scanDirection"`
-}
-
-type scanResult struct {
-	ScannerResults []scannerResult `json:"scannerResults"`
-	Outcome        string          `json:"outcome"`
+	ScannerID     string             `json:"scannerId"`
+	VersionMeta   scannerVersionMeta `json:"scannerVersionMeta"`
+	Outcome       string             `json:"outcome"` // "passed" | "failed"
+	Message       string             `json:"message"`
+	ScanDirection string             `json:"scanDirection"`
+	Data          struct {
+		Type       string `json:"type"`
+		TokenUsage int    `json:"tokenUsage"`
+	} `json:"data"`
 }
 
 type scanResponse struct {
-	ID            string     `json:"id"`
-	Result        scanResult `json:"result"`
-	RedactedInput string     `json:"redactedInput"`
+	ID     string `json:"id"`
+	Result struct {
+		ScannerResults []scannerResult `json:"scannerResults"`
+		// Observed values: "cleared", "flagged". Treat anything that is not
+		// exactly "cleared" as a block — new outcome strings must fail closed.
+		Outcome string `json:"outcome"`
+	} `json:"result"`
+	RedactedInput string `json:"redactedInput"`
 }
 
-// callGuardrail sends the given text (a request prompt or a response
-// completion — same shape either way) to the CAI Scans API and
-// reports whether it was flagged unsafe, along with the redacted form
-// of the prompt as returned by the scan API. A scan only counts as
-// safe when result.outcome is exactly "cleared" — any other value (a
-// specific block reason, or an outcome this code doesn't recognize
-// yet) fails closed, consistent with the transport/parsing error
-// handling below. redacted is "" when the API returned nothing
-// usable; callers must treat that as "no redaction available" rather
-// than "redact to empty".
-func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool, redacted string, err error) {
-	reqBody, err := json.Marshal(scanRequest{Input: content})
+// verdict is the normalised outcome of one scan.
+type verdict struct {
+	ScanID   string
+	Blocked  bool
+	Outcome  string   // raw outcome string, for logging
+	Failed   []string // "<scanner-id> (<package>)" per non-passing scanner
+	Tokens   int      // summed across all scanners
+	Redacted string
+}
+
+// normalise reduces a scan response to a verdict.
+//
+// Fails closed: only an explicit "cleared" outcome with no failing scanner
+// lets the request through. An empty, unknown or unparseable outcome blocks.
+func (sr scanResponse) normalise() verdict {
+	v := verdict{
+		ScanID:   sr.ID,
+		Outcome:  sr.Result.Outcome,
+		Redacted: sr.RedactedInput,
+	}
+	for _, s := range sr.Result.ScannerResults {
+		v.Tokens += s.Data.TokenUsage
+		if s.Outcome != "passed" {
+			entry := s.ScannerID
+			if s.VersionMeta.Name != "" {
+				entry += " (" + s.VersionMeta.Name + ")"
+			}
+			if s.Message != "" {
+				entry += ": " + s.Message
+			}
+			v.Failed = append(v.Failed, entry)
+		}
+	}
+	v.Blocked = sr.Result.Outcome != "cleared" || len(v.Failed) > 0
+	return v
+}
+
+// callGuardrail sends the given text (a request prompt) to the CAI Scans
+// API and normalises the response into a verdict, including the redacted
+// form of the prompt as returned by the scan API. A scan only counts as
+// safe when result.outcome is exactly "cleared" and every scanner reported
+// "passed" — any other value (a specific block reason, or an outcome this
+// code doesn't recognize yet) fails closed, consistent with the
+// transport/parsing error handling below. verdict.Redacted is "" when the
+// API returned nothing usable; callers must treat that as "no redaction
+// available" rather than "redact to empty".
+func callGuardrail(ctx context.Context, cfg config, prompt string) (verdict, error) {
+	start := time.Now()
+
+	reqBody, err := json.Marshal(scanRequest{Input: prompt})
 	if err != nil {
-		return true, "", err
+		return verdict{}, err
 	}
 
 	url := strings.TrimRight(cfg.endpoint, "/") + "/scans"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
-		return true, "", err
+		return verdict{}, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if cfg.apiKey != "" {
@@ -182,13 +219,13 @@ func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return true, "", err
+		return verdict{}, err
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return true, "", err
+		return verdict{}, err
 	}
 
 	// GUARDRAIL_DEBUG record line: the call, the status, and the exact
@@ -202,26 +239,19 @@ func callGuardrail(ctx context.Context, cfg config, content string) (unsafe bool
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("scan API returned %d: %s", resp.StatusCode, string(respBody))
-		return true, "", nil
+		return verdict{}, fmt.Errorf("scan API returned %d", resp.StatusCode)
 	}
 
-	var parsed scanResponse
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return true, "", err
+	var sr scanResponse
+	if err := json.Unmarshal(respBody, &sr); err != nil {
+		return verdict{}, fmt.Errorf("decoding scan response: %w", err)
 	}
 
-	if parsed.Result.Outcome != "cleared" {
-		var flagged []string
-		for _, sr := range parsed.Result.ScannerResults {
-			if sr.Outcome != "passed" {
-				flagged = append(flagged, sr.ScannerID+":"+sr.Outcome)
-			}
-		}
-		log.Printf("scan %s flagged (outcome=%s, scanners=%v), redactedInput=%q",
-			parsed.ID, parsed.Result.Outcome, flagged, parsed.RedactedInput)
-		return true, parsed.RedactedInput, nil
-	}
-	return false, parsed.RedactedInput, nil
+	v := sr.normalise()
+	log.Printf("scan id=%s outcome=%s blocked=%t failed=%d tokens=%d latency=%s",
+		v.ScanID, v.Outcome, v.Blocked, len(v.Failed), v.Tokens,
+		time.Since(start).Round(time.Millisecond))
+	return v, nil
 }
 
 // oneLine collapses whitespace (including embedded newlines) so a
@@ -342,7 +372,14 @@ func blockedGentleBody() []byte {
 // message so OpenAI-compatible clients render it as a normal chat
 // turn rather than raising an SDK-level error. The real block reason
 // (for your own logs/alerting, not shown to the end user) goes in the
-// x-guardrail-blocked header.
+// x-guardrail-blocked header. scanID, when non-empty, goes in a
+// separate x-guardrail-scan-id header — that's what lets you pull the
+// full scanner breakdown from the CalypsoAI console for a block a
+// user reports as a false positive.
+//
+// Deliberately *not* included: the failing scanner IDs. Those tell a
+// caller which detector fired, which is a probing aid for anyone
+// searching for a phrasing that gets through — logs, not the wire.
 //
 // Both Value and RawValue are set on each header. Evidence from a
 // live curl test: header KEYS came through but VALUES were empty
@@ -352,32 +389,41 @@ func blockedGentleBody() []byte {
 // Envoy build (v1.37.0) appears to only honor RawValue. Setting both
 // covers either case without needing to know which one a given Envoy
 // version actually reads.
-func blockedResponse(reason string) *extprocv3.ProcessingResponse {
+func blockedResponse(reason, scanID string) *extprocv3.ProcessingResponse {
+	headers := []*corev3.HeaderValueOption{
+		{
+			Header: &corev3.HeaderValue{
+				Key:      "content-type",
+				Value:    "application/json",
+				RawValue: []byte("application/json"),
+			},
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		},
+		{
+			Header: &corev3.HeaderValue{
+				Key:      "x-guardrail-blocked",
+				Value:    reason,
+				RawValue: []byte(reason),
+			},
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		},
+	}
+	if scanID != "" {
+		headers = append(headers, &corev3.HeaderValueOption{
+			Header: &corev3.HeaderValue{
+				Key:      "x-guardrail-scan-id",
+				Value:    scanID,
+				RawValue: []byte(scanID),
+			},
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		})
+	}
 	return &extprocv3.ProcessingResponse{
 		Response: &extprocv3.ProcessingResponse_ImmediateResponse{
 			ImmediateResponse: &extprocv3.ImmediateResponse{
-				Status: &typev3.HttpStatus{Code: typev3.StatusCode_OK},
-				Body:   blockedGentleBody(),
-				Headers: &extprocv3.HeaderMutation{
-					SetHeaders: []*corev3.HeaderValueOption{
-						{
-							Header: &corev3.HeaderValue{
-								Key:      "content-type",
-								Value:    "application/json",
-								RawValue: []byte("application/json"),
-							},
-							AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
-						},
-						{
-							Header: &corev3.HeaderValue{
-								Key:      "x-guardrail-blocked",
-								Value:    reason,
-								RawValue: []byte(reason),
-							},
-							AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
-						},
-					},
-				},
+				Status:  &typev3.HttpStatus{Code: typev3.StatusCode_OK},
+				Body:    blockedGentleBody(),
+				Headers: &extprocv3.HeaderMutation{SetHeaders: headers},
 			},
 		},
 	}
@@ -446,20 +492,20 @@ func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServ
 			prompt := extractPrompt(original)
 
 			ctx, cancel := context.WithTimeout(stream.Context(), 5*time.Second)
-			unsafe, redacted, err := callGuardrail(ctx, s.cfg, prompt)
+			v, err := callGuardrail(ctx, s.cfg, prompt)
 			cancel()
 
 			if err != nil {
-				// fail closed: block on guardrail-service errors
-				log.Printf("guardrail call failed, blocking (fail-closed): %v", err)
-				if err := stream.Send(blockedResponse("guardrail_unavailable")); err != nil {
+				log.Printf("guardrail check [request]: BLOCKED (guardrail_unavailable): %v", err)
+				if err := stream.Send(blockedResponse("guardrail_unavailable", "")); err != nil {
 					return err
 				}
 				continue
 			}
-			if unsafe {
-				log.Printf("guardrail check [request]: BLOCKED")
-				if err := stream.Send(blockedResponse("flagged_unsafe")); err != nil {
+			if v.Blocked {
+				log.Printf("guardrail check [request]: BLOCKED scan=%s outcome=%s failed=[%s]",
+					v.ScanID, v.Outcome, strings.Join(v.Failed, "; "))
+				if err := stream.Send(blockedResponse("flagged_unsafe", v.ScanID)); err != nil {
 					return err
 				}
 				continue
@@ -468,18 +514,18 @@ func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServ
 			// Cleared. Substitute the redacted prompt only when the scan
 			// actually changed something and the body is a shape we can
 			// rewrite; otherwise forward the original bytes untouched.
-			if redacted != "" && redacted != prompt {
-				if newBody, ok := redactBody(original, redacted); ok {
-					log.Printf("guardrail check [request]: passed (redacted, %d -> %d bytes)",
-						len(original), len(newBody))
+			if v.Redacted != "" && v.Redacted != prompt {
+				if newBody, ok := redactBody(original, v.Redacted); ok {
+					log.Printf("guardrail check [request]: passed scan=%s (redacted, %d -> %d bytes)",
+						v.ScanID, len(original), len(newBody))
 					if err := stream.Send(continueWithBody(newBody)); err != nil {
 						return err
 					}
 					continue
 				}
-				log.Printf("guardrail check [request]: passed (redaction available but body not rewritable, forwarding original)")
+				log.Printf("guardrail check [request]: passed scan=%s (redaction available but body not rewritable, forwarding original)", v.ScanID)
 			} else {
-				log.Printf("guardrail check [request]: passed")
+				log.Printf("guardrail check [request]: passed scan=%s", v.ScanID)
 			}
 			if err := stream.Send(continueRequest()); err != nil {
 				return err
