@@ -158,6 +158,7 @@ type verdict struct {
 	Blocked  bool
 	Outcome  string   // raw outcome string, for logging
 	Failed   []string // "<scanner-id> (<package>)" per non-passing scanner
+	Messages []string // non-empty scanner "message" fields, in scan order
 	Tokens   int      // summed across all scanners
 	Redacted string
 }
@@ -174,6 +175,9 @@ func (sr scanResponse) normalise() verdict {
 	}
 	for _, s := range sr.Result.ScannerResults {
 		v.Tokens += s.Data.TokenUsage
+		if s.Message != "" {
+			v.Messages = append(v.Messages, s.Message)
+		}
 		if s.Outcome != "passed" {
 			entry := s.ScannerID
 			if s.VersionMeta.Name != "" {
@@ -343,12 +347,22 @@ type guardrailServer struct {
 
 const gentleBlockedMessage = "I'm sorry, but I can't help with that request."
 
+// blockedContent picks the assistant text for a blocked request: every
+// scanner-provided message joined by newlines, or the gentle refusal
+// when no scanner supplied one.
+func blockedContent(messages []string) string {
+	if len(messages) == 0 {
+		return gentleBlockedMessage
+	}
+	return strings.Join(messages, "\n")
+}
+
 // blockedGentleBody builds a synthetic OpenAI chat-completion response
-// body carrying the gentle refusal as the assistant's message content,
-// with finish_reason set to the standard "content_filter" value. This
-// is what makes the SDK/chat UI show it as a normal assistant turn
-// instead of throwing an error.
-func blockedGentleBody() []byte {
+// body carrying content as the assistant's message, with finish_reason
+// set to the standard "content_filter" value. This is what makes the
+// SDK/chat UI show it as a normal assistant turn instead of throwing
+// an error.
+func blockedGentleBody(content string) []byte {
 	body := map[string]any{
 		"id":     "guardrail-blocked",
 		"object": "chat.completion",
@@ -358,7 +372,7 @@ func blockedGentleBody() []byte {
 				"index": 0,
 				"message": map[string]string{
 					"role":    "assistant",
-					"content": gentleBlockedMessage,
+					"content": content,
 				},
 				"finish_reason": "content_filter",
 			},
@@ -368,8 +382,8 @@ func blockedGentleBody() []byte {
 	return b
 }
 
-// blockedResponse returns 200 with a synthesized gentle assistant
-// message so OpenAI-compatible clients render it as a normal chat
+// blockedResponse returns 200 with a synthesized assistant message
+// (content, see blockedContent) so OpenAI-compatible clients render it as a normal chat
 // turn rather than raising an SDK-level error. The real block reason
 // (for your own logs/alerting, not shown to the end user) goes in the
 // x-guardrail-blocked header. scanID, when non-empty, goes in a
@@ -377,9 +391,9 @@ func blockedGentleBody() []byte {
 // full scanner breakdown from the CalypsoAI console for a block a
 // user reports as a false positive.
 //
-// Deliberately *not* included: the failing scanner IDs. Those tell a
-// caller which detector fired, which is a probing aid for anyone
-// searching for a phrasing that gets through — logs, not the wire.
+// Deliberately *not* included: the failing scanner IDs. Note that the
+// scanner-configured messages in the body may still name the guardrail
+// that fired — that text is under the guardrail admin's control.
 //
 // Both Value and RawValue are set on each header. Evidence from a
 // live curl test: header KEYS came through but VALUES were empty
@@ -389,7 +403,7 @@ func blockedGentleBody() []byte {
 // Envoy build (v1.37.0) appears to only honor RawValue. Setting both
 // covers either case without needing to know which one a given Envoy
 // version actually reads.
-func blockedResponse(reason, scanID string) *extprocv3.ProcessingResponse {
+func blockedResponse(reason, scanID, content string) *extprocv3.ProcessingResponse {
 	headers := []*corev3.HeaderValueOption{
 		{
 			Header: &corev3.HeaderValue{
@@ -422,7 +436,7 @@ func blockedResponse(reason, scanID string) *extprocv3.ProcessingResponse {
 		Response: &extprocv3.ProcessingResponse_ImmediateResponse{
 			ImmediateResponse: &extprocv3.ImmediateResponse{
 				Status:  &typev3.HttpStatus{Code: typev3.StatusCode_OK},
-				Body:    blockedGentleBody(),
+				Body:    blockedGentleBody(content),
 				Headers: &extprocv3.HeaderMutation{SetHeaders: headers},
 			},
 		},
@@ -497,7 +511,7 @@ func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServ
 
 			if err != nil {
 				log.Printf("guardrail check [request]: BLOCKED (guardrail_unavailable): %v", err)
-				if err := stream.Send(blockedResponse("guardrail_unavailable", "")); err != nil {
+				if err := stream.Send(blockedResponse("guardrail_unavailable", "", gentleBlockedMessage)); err != nil {
 					return err
 				}
 				continue
@@ -505,7 +519,7 @@ func (s *guardrailServer) Process(stream extprocv3.ExternalProcessor_ProcessServ
 			if gv.Blocked {
 				log.Printf("guardrail check [request]: BLOCKED scan=%s outcome=%s failed=[%s]",
 					gv.ScanID, gv.Outcome, strings.Join(gv.Failed, "; "))
-				if err := stream.Send(blockedResponse("flagged_unsafe", gv.ScanID)); err != nil {
+				if err := stream.Send(blockedResponse("flagged_unsafe", gv.ScanID, blockedContent(gv.Messages))); err != nil {
 					return err
 				}
 				continue
