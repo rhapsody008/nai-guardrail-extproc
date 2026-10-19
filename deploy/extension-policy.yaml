@@ -1,0 +1,57 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyExtensionPolicy
+metadata:
+  name: guardrail-extproc-policy
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: nai-ingress-gateway
+  extProc:
+    - backendRefs:
+        - name: guardrail-extproc
+          port: 9002
+      # THE DEFAULT HERE IS 200ms if unset — nowhere near enough for an
+      # LLM inference call, and the likely cause of intermittent
+      # "context canceled" failures where Envoy tore down the stream
+      # before the guardrail could respond. This is the timeout for a
+      # single gRPC response from the extproc, separate from the
+      # backend gRPC connection timeout shown in Envoy's own config
+      # dump. Set generously — the actual latency budget is enforced
+      # by callGuardrail's own 5s context.WithTimeout in
+      # guardrail_extproc.go, and by max_tokens capping generation
+      # length on the guardrail model call itself.
+      messageTimeout: 15s
+      # NOTE: no response: block — pre-call only. Post-call checking
+      # was dropped because, with Buffered response mode, it can only
+      # start after the entire completion is already generated,
+      # adding a full extra sequential LLM call with zero bytes
+      # visible to the client. That was pushing total round-trip time
+      # into an upstream Cloudflare Tunnel timeout that isn't
+      # configurable from this side. Omitting processingMode.response
+      # entirely (not just its body field) stops Envoy from sending
+      # response-phase messages to this filter at all.
+      processingMode:
+        request:
+          body: Buffered
+      # This is attached at Gateway level, so every request through
+      # nai-ingress-gateway reaches this filter — UI, IAM, oauth2-proxy,
+      # MCP, dataplane, health, not just model calls. Scope is enforced
+      # in guardrail_extproc.go (see inScope/scopedSuffixes), which
+      # passes anything that isn't a chat/completions-style POST
+      # straight through with no CalypsoAI call. Do NOT also attach a
+      # route-scoped EnvoyExtensionPolicy (e.g. targeting an HTTPRoute)
+      # alongside this one — a route-scoped policy overrides this one
+      # for its routes, which is what caused the per-route enablement
+      # collision this policy replaces.
+      #
+      # failOpen: true while validating this rollout — a broken
+      # extproc pod must not be able to take down login/IAM/MCP, since
+      # this filter now sits in front of all of them. This is separate
+      # from the fail-closed behavior inside guardrail_extproc.go,
+      # which governs what happens when the extproc reaches the
+      # *guardrail model* but that call fails. Flip back to false only
+      # after confirming gateway-level scoping doesn't break anything
+      # non-model going through the gateway (see rollout notes in the
+      # scoping patch).
+      failOpen: true

@@ -1,0 +1,7 @@
+# Read from Git by the NKP GitOps source (Path: ./gitops). Lists the
+# Flux objects only — the app manifests themselves arrive via the OCI
+# artifact that CI pushes from deploy/.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - nai-guardrail-extproc.yaml

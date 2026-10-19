@@ -1,0 +1,111 @@
+name: release
+
+# push to main: build + push the image, pin its digest into deploy/ in
+# the workspace only, push deploy/ as an OCI artifact tagged with the
+# short SHA, and move the dev tag to it — Flux picks it up from there.
+# CI never commits or pushes to Git; the digest lives only inside the
+# artifact.
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+    # gitops/ is Flux wiring read from Git, not part of a release.
+    # Path filters are not evaluated for tag pushes.
+    paths-ignore: ['gitops/**', '**.md']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/rhapsody008/nai-guardrail-extproc
+  MANIFESTS: oci://ghcr.io/rhapsody008/manifests/nai-guardrail-extproc
+
+# serialize releases so two pushes can't race on the dev tag
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Skip on pull_request: forked PRs don't get access to secrets,
+      # and untrusted PR code shouldn't be able to push to the registry.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # full commit SHA so image and manifest artifact share an
+      # identifier; semver tags on v* tag pushes. No latest — the
+      # cluster runs whatever digest the dev artifact pins.
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      # PRs build the image (catches a broken Dockerfile before merge)
+      # but don't push it, since there's nothing trustworthy to publish
+      # from unreviewed changes yet.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # everything below only runs for main — PRs and v* tags stop at
+      # the image
+      - name: Set up Flux CLI
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: fluxcd/flux2/action@v2.9.6
+
+      # kustomize ships on GitHub's Ubuntu runners; add an install
+      # step if this ever moves to a self-hosted runner
+      - name: Pin digest (workspace only, never committed)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        working-directory: deploy
+        run: |
+          kustomize edit set image nai-guardrail-extproc=${IMAGE}@${{ steps.build.outputs.digest }}
+          grep -q '@sha256:' kustomization.yaml
+          kustomize build . > /dev/null
+
+      - name: Push manifest artifact
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          flux push artifact ${MANIFESTS}:${GITHUB_SHA::7} \
+            --path=./deploy \
+            --source="${{ github.server_url }}/${{ github.repository }}" \
+            --revision="${GITHUB_REF_NAME}@sha1:${GITHUB_SHA}"
+
+      - name: Promote to dev
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          flux tag artifact ${MANIFESTS}:${GITHUB_SHA::7} --tag dev
+          {
+            echo "image: \`${IMAGE}@${{ steps.build.outputs.digest }}\`"
+            echo
+            echo "manifests: \`${MANIFESTS}:${GITHUB_SHA::7}\` (tagged \`dev\`)"
+          } >> "$GITHUB_STEP_SUMMARY"

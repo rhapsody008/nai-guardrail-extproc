@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guardrail-extproc
+  labels:
+    app: guardrail-extproc
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: guardrail-extproc
+  template:
+    metadata:
+      labels:
+        app: guardrail-extproc
+    spec:
+      # public GHCR image — no imagePullSecrets needed
+      containers:
+        - name: guardrail-extproc
+          image: nai-guardrail-extproc # name only; kustomization.yaml maps it, CI pins the digest
+          ports:
+            - name: grpc
+              containerPort: 9002
+          env:
+            - name: GUARDRAIL_ENDPOINT
+              value: "https://us1.calypsoai.app/backend/v1" # CAI base URL — the extproc appends /scans itself
+            - name: GUARDRAIL_DEBUG
+              value: "true" # logs raw prompt content + full CAI response — fine for this test deployment, turn off before anything handles real user data
+            - name: GUARDRAIL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: guardrail-extproc-creds
+                  key: GUARDRAIL_API_KEY
+          # the binary has no grpc.health.v1 health service, so probe
+          # the port directly rather than via grpc_health_probe
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

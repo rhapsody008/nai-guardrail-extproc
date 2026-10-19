@@ -1,0 +1,31 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: nai-guardrail-extproc
+  namespace: nai-system
+spec:
+  interval: 2m
+  url: oci://ghcr.io/rhapsody008/manifests/nai-guardrail-extproc
+  # CI moves the dev tag to each new artifact on push to main;
+  # roll back by retagging dev to an earlier sha7 (see README)
+  ref:
+    tag: dev
+  # no secretRef — the GHCR package is public
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: nai-guardrail-extproc
+  namespace: nai-system
+spec:
+  interval: 10m
+  sourceRef:
+    kind: OCIRepository
+    name: nai-guardrail-extproc
+  path: ./ # artifact root is deploy/
+  prune: true
+  wait: true
+  timeout: 3m
+  # must be nai-system: the EnvoyExtensionPolicy has to sit in the
+  # Gateway's namespace, and the Service alongside it
+  targetNamespace: nai-system

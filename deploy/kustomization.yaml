@@ -1,0 +1,16 @@
+# Packaged into the OCI artifact by CI; Flux never reads this from Git.
+# No namespace here: the Flux Kustomization's targetNamespace sets
+# nai-system, which must match the Gateway's namespace — Gateway API
+# policy attachment rule for extension-policy.yaml, and lets its
+# backendRef reach the Service without a ReferenceGrant.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+  - extension-policy.yaml
+images:
+  # name only — CI runs `kustomize edit set image` in its workspace to
+  # pin the digest; the digest is never committed
+  - name: nai-guardrail-extproc
+    newName: ghcr.io/rhapsody008/nai-guardrail-extproc
